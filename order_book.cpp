@@ -13,6 +13,11 @@
 
 using Price = double;
 
+struct PriceLevel {
+    double price;
+    uint64_t total_quantity;
+};
+
 constexpr size_t MEMORY_POOL_BLOCK_SIZE = 1024;
 constexpr size_t MAX_ORDER_QUANTITY = 1000000;
 constexpr double MIN_PRICE = 0.01;
@@ -114,7 +119,7 @@ struct Order {
     }
 };
 
-struct PriceLevel {
+struct InternalPriceLevel {
     double price;
     uint64_t total_quantity{0};
     Order* first_order{nullptr};
@@ -122,15 +127,15 @@ struct PriceLevel {
     size_t order_count{0};
     bool is_active{true};
 
-    PriceLevel() : price(0.0) {}
-    PriceLevel(double p) : price(p) {}
+    InternalPriceLevel() : price(0.0) {}
+    InternalPriceLevel(double p) : price(p) {}
     
-    PriceLevel(const PriceLevel& other)
+    InternalPriceLevel(const InternalPriceLevel& other)
         : price(other.price), total_quantity(other.total_quantity),
           first_order(nullptr), last_order(nullptr), order_count(other.order_count),
           is_active(other.is_active) {}
     
-    PriceLevel& operator=(const PriceLevel& other) {
+    InternalPriceLevel& operator=(const InternalPriceLevel& other) {
         if (this != &other) {
             price = other.price;
             total_quantity = other.total_quantity;
@@ -191,18 +196,17 @@ struct PriceLevel {
 
 class OrderBook {
 private:
-    std::map<Price, PriceLevel*, std::greater<Price>> bids_;
-    std::map<Price, PriceLevel*> asks_;
+    std::map<Price, InternalPriceLevel*, std::greater<Price>> bids_;
+    std::map<Price, InternalPriceLevel*> asks_;
     std::unordered_map<uint64_t, Order*> order_lookup_;
     SimpleMemoryPool<Order> order_pool_;
-    SimpleMemoryPool<PriceLevel> level_pool_;
+    SimpleMemoryPool<InternalPriceLevel> level_pool_;
     
     bool matching_in_progress_{false};
     uint64_t version_{0};
 
 public:
     ~OrderBook() {
-        // Clean up all orders
         for (auto& [id, order] : order_lookup_) {
             if (order) {
                 order_pool_.deallocate(order);
@@ -210,7 +214,6 @@ public:
         }
         order_lookup_.clear();
         
-        // Clean up all bid levels
         for (auto& [price, level] : bids_) {
             if (level) {
                 level_pool_.deallocate(level);
@@ -218,7 +221,6 @@ public:
         }
         bids_.clear();
         
-        // Clean up all ask levels
         for (auto& [price, level] : asks_) {
             if (level) {
                 level_pool_.deallocate(level);
@@ -228,7 +230,6 @@ public:
     }
 
     bool add_order(const Order& o) {
-        // Input validation
         if (o.order_id == 0) {
             std::cerr << "Error: Invalid order ID (0)\n";
             return false;
@@ -244,7 +245,6 @@ public:
             return false;
         }
         
-        // Check for duplicate order ID
         if (order_lookup_.find(o.order_id) != order_lookup_.end()) {
             std::cerr << "Error: Duplicate order ID: " << o.order_id << "\n";
             return false;
@@ -256,14 +256,14 @@ public:
             return false;
         }
         
-        *new_order = o;  // Use assignment operator
+        *new_order = o;
         new_order->next = nullptr;
         new_order->prev = nullptr;
         new_order->is_active = true;
         
         order_lookup_[o.order_id] = new_order;
         
-        PriceLevel* level = get_or_create_level(o.price, o.is_buy);
+        InternalPriceLevel* level = get_or_create_level(o.price, o.is_buy);
         if (!level) {
             order_lookup_.erase(o.order_id);
             order_pool_.deallocate(new_order);
@@ -299,7 +299,7 @@ public:
             return false;
         }
         
-        PriceLevel* level = get_level(order->price, order->is_buy);
+        InternalPriceLevel* level = get_level(order->price, order->is_buy);
         
         if (level) {
             level->remove_order(order);
@@ -310,6 +310,67 @@ public:
         }
         
         order_pool_.deallocate(order);
+        version_++;
+        return true;
+    }
+
+    bool amend_order(uint64_t order_id, double new_price, uint64_t new_quantity) {
+        if (order_id == 0) {
+            std::cerr << "Error: Invalid order ID (0)\n";
+            return false;
+        }
+        
+        if (new_price < MIN_PRICE || new_price > MAX_PRICE || std::isnan(new_price) || std::isinf(new_price)) {
+            std::cerr << "Error: Invalid price: " << new_price << " (must be between " << MIN_PRICE << " and " << MAX_PRICE << ")\n";
+            return false;
+        }
+        
+        if (new_quantity == 0 || new_quantity > MAX_ORDER_QUANTITY) {
+            std::cerr << "Error: Invalid quantity: " << new_quantity << " (must be between 1 and " << MAX_ORDER_QUANTITY << ")\n";
+            return false;
+        }
+        
+        auto it = order_lookup_.find(order_id);
+        if (it == order_lookup_.end()) {
+            std::cerr << "Error: Order not found: " << order_id << "\n";
+            return false;
+        }
+        
+        Order* order = it->second;
+        if (!order || !order->is_active) {
+            std::cerr << "Error: Order is not active: " << order_id << "\n";
+            return false;
+        }
+        
+        if (order->price != new_price) {
+            InternalPriceLevel* old_level = get_level(order->price, order->is_buy);
+            if (old_level) {
+                old_level->remove_order(order);
+                if (old_level->is_empty()) {
+                    remove_price_level(old_level->price, order->is_buy);
+                }
+            }
+            
+            order->price = new_price;
+            order->quantity = new_quantity;
+            
+            InternalPriceLevel* new_level = get_or_create_level(new_price, order->is_buy);
+            if (!new_level) {
+                std::cerr << "Error: Failed to create price level for " << new_price << "\n";
+                return false;
+            }
+            new_level->add_order(order);
+        } else {
+            InternalPriceLevel* level = get_level(order->price, order->is_buy);
+            if (level) {
+                level->total_quantity = level->total_quantity - order->quantity + new_quantity;
+                order->quantity = new_quantity;
+            } else {
+                std::cerr << "Error: Price level not found for order " << order_id << "\n";
+                return false;
+            }
+        }
+        
         version_++;
         return true;
     }
@@ -332,8 +393,8 @@ public:
                 break;
             }
             
-            PriceLevel* bid_level = best_bid->second;
-            PriceLevel* ask_level = best_ask->second;
+            InternalPriceLevel* bid_level = best_bid->second;
+            InternalPriceLevel* ask_level = best_ask->second;
             
             if (!bid_level->is_active || !ask_level->is_active) {
                 break;
@@ -412,32 +473,25 @@ public:
         std::cout << "Spread: " << get_spread() << "\n";
     }
 
-    struct  SnapshotLevel {
-        double price;
-        uint64_t total_quantity;
-        size_t order_count;
-    };
     
-    void get_snapshot(size_t depth, std::vector<SnapshotLevel>& bids_out, std::vector<SnapshotLevel>& asks_out) const {
-        bids_out.clear();
-        asks_out.clear();
+    void get_snapshot(size_t depth, std::vector<PriceLevel>& bids, std::vector<PriceLevel>& asks) const {
+        bids.clear();
+        asks.clear();
         
         auto bid_it = bids_.begin();
         for (size_t i = 0; i < depth && bid_it != bids_.end(); ++i, ++bid_it) {
-            SnapshotLevel snapshot;
-            snapshot.price = bid_it->second->price;
-            snapshot.total_quantity = bid_it->second->total_quantity;
-            snapshot.order_count = bid_it->second->order_count;
-            bids_out.push_back(snapshot);
+            PriceLevel level;
+            level.price = bid_it->second->price;
+            level.total_quantity = bid_it->second->total_quantity;
+            bids.push_back(level);
         }
         
         auto ask_it = asks_.begin();
         for (size_t i = 0; i < depth && ask_it != asks_.end(); ++i, ++ask_it) {
-            SnapshotLevel snapshot;
-            snapshot.price = ask_it->second->price;
-            snapshot.total_quantity = ask_it->second->total_quantity;
-            snapshot.order_count = ask_it->second->order_count;
-            asks_out.push_back(snapshot);
+            PriceLevel level;
+            level.price = ask_it->second->price;
+            level.total_quantity = ask_it->second->total_quantity;
+            asks.push_back(level);
         }
     }
 
@@ -474,14 +528,14 @@ public:
 
 private:
 
-    PriceLevel* get_or_create_level(Price price, bool is_buy) {
+    InternalPriceLevel* get_or_create_level(Price price, bool is_buy) {
         if (is_buy) {
             auto it = bids_.find(price);
             if (it != bids_.end()) {
                 return it->second;
             }
             
-            PriceLevel* level = level_pool_.allocate();
+            InternalPriceLevel* level = level_pool_.allocate();
             level->price = price;
             level->total_quantity = 0;
             level->order_count = 0;
@@ -494,7 +548,7 @@ private:
                 return it->second;
             }
             
-            PriceLevel* level = level_pool_.allocate();
+            InternalPriceLevel* level = level_pool_.allocate();
             level->price = price;
             level->total_quantity = 0;
             level->order_count = 0;
@@ -504,7 +558,7 @@ private:
         }
     }
 
-    PriceLevel* get_level(Price price, bool is_buy) const {
+    InternalPriceLevel* get_level(Price price, bool is_buy) const {
         if (is_buy) {
             auto it = bids_.find(price);
             return (it != bids_.end()) ? it->second : nullptr;
@@ -518,8 +572,8 @@ private:
         return order_lookup_.find(order_id) != order_lookup_.end();
     }
     
-    bool remove_filled_order(Order* order, PriceLevel* level, 
-                           const std::map<Price, PriceLevel*>::iterator& map_it, bool is_buy) {
+    bool remove_filled_order(Order* order, InternalPriceLevel* level, 
+                           const std::map<Price, InternalPriceLevel*>::iterator& map_it, bool is_buy) {
         if (order->quantity == 0) {
             level->remove_order(order);
             
@@ -533,10 +587,10 @@ private:
                     asks_.erase(map_it);
                 }
                 level_pool_.deallocate(level);
-                return true;  // Level was removed
+                return true;
             }
         }
-        return false;  // Level still exists
+        return false;
     }
     
     void remove_price_level(Price price, bool is_buy) {
@@ -572,7 +626,7 @@ void test_order_book() {
     std::cout << "\nAfter matching:\n";
     book.print_book();
     
-    std::vector<OrderBook::SnapshotLevel> bids, asks;
+    std::vector<PriceLevel> bids, asks;
     book.get_snapshot(3, bids, asks);
     
     std::cout << "\nSnapshot (top 3 levels):\n";
@@ -588,6 +642,28 @@ void test_order_book() {
     book.cancel_order(2);
     std::cout << "\nAfter canceling order 2:\n";
     book.print_book();
+    
+    book.add_order({6, true, 100.30, 200, 1234567895});
+    book.add_order({7, false, 100.70, 300, 1234567896});
+    
+    std::cout << "\nAfter adding orders 6 and 7:\n";
+    book.print_book();
+    
+    std::cout << "\n=== Testing amend_order ===\n";
+    
+    std::cout << "\nAmending order 6 quantity from 200 to 400 (same price):\n";
+    bool amend1 = book.amend_order(6, 100.30, 400);
+    std::cout << "Result: " << (amend1 ? "Success" : "Failed") << "\n";
+    book.print_book();
+    
+    std::cout << "\nAmending order 7 price from 100.70 to 100.80 (price change):\n";
+    bool amend2 = book.amend_order(7, 100.80, 300);
+    std::cout << "Result: " << (amend2 ? "Success" : "Failed") << "\n";
+    book.print_book();
+    
+    std::cout << "\nTrying to amend non-existent order 999:\n";
+    bool amend3 = book.amend_order(999, 100.0, 100);
+    std::cout << "Result: " << (amend3 ? "Success" : "Failed") << "\n";
 }
 
 void stress_test() {
